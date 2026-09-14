@@ -9,6 +9,13 @@
 #            GUI's catch_unwind recovery. ks-driver needs the WDK; the job
 #            locates it, then checks with dumpbin that the linked image imports
 #            no ntdll.dll (the load failure documented in AGENTS.md).
+#
+# windows-2022 is pinned on purpose. It is the only x64 hosted image that ships
+# the WDK kit: the image's own provisioning script refuses every other OS, and
+# windows-latest (Server 2025) carries only the WDK Visual Studio extension, not
+# the headers and kernel libraries. The locate step installs the kit itself when
+# it is missing, so moving to another image later does not quietly drop
+# ks-driver.sys from the artifacts.
 
 name: Build
 
@@ -29,14 +36,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # windows-latest images ship the WDK. Set this to "false" only if a run must
-  # succeed without producing the native driver image.
+  # Set to "false" only if a run must succeed without producing the native
+  # driver image.
   REQUIRE_WDK: "true"
+  # windows-2022 already has the kit; any other image gets it from wdksetup.
+  INSTALL_WDK_IF_MISSING: "true"
 
 jobs:
   verify:
     name: fmt / check / test
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,12 +65,14 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-registry-
 
+      # The image is part of the key: object files built on one Windows image
+      # must not be restored onto another.
       - name: Cache build output
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-target-
+          key: ${{ runner.os }}-win2022-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-win2022-cargo-target-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -74,7 +85,7 @@ jobs:
 
   build:
     name: release images
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,12 +103,14 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-registry-
 
+      # The image is part of the key: object files built on one Windows image
+      # must not be restored onto another.
       - name: Cache build output
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-target-
+          key: ${{ runner.os }}-win2022-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-win2022-cargo-target-
 
       - name: Build user-mode binaries
         run: cargo build --release -p ks-service -p ks-installer
@@ -108,50 +121,100 @@ jobs:
       - name: Build ks-gui
         run: cargo build --profile gui-release -p ks-gui
 
-      # The image's WDK lives at C:\Program Files (x86)\Windows Kits\10. Pick the
-      # documented known-good version when present, otherwise the newest one that
-      # has both kernel headers and x64 kernel libraries.
+      # The WDK is not always where the documented layout says: the kits root is
+      # recorded in the registry, WDKContentRoot is set by a WDK developer
+      # prompt, and both Program Files flavours exist across images. Ask all of
+      # them before concluding anything, and print a full dump when it still
+      # fails so one run explains the whole picture.
       - name: Locate WDK
         id: wdk
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
-          $found = $false
 
-          if (Test-Path (Join-Path $kitsRoot 'Include')) {
-            $versions = Get-ChildItem (Join-Path $kitsRoot 'Include') -Directory |
-              Where-Object {
-                $_.Name -match '^\d+(\.\d+){1,3}$' -and
-                (Test-Path (Join-Path $_.FullName 'km\ntddk.h'))
-              } |
-              Sort-Object { [version]$_.Name } -Descending |
-              Select-Object -ExpandProperty Name
-
-            $ordered = @('10.0.26100.0') + ($versions | Where-Object { $_ -ne '10.0.26100.0' })
-
-            foreach ($version in $ordered) {
-              $lib = Join-Path $kitsRoot "Lib\$version\km\x64"
-              if (-not (Test-Path (Join-Path $lib 'ntoskrnl.lib'))) { continue }
-
-              "WDK_ROOT=$kitsRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-              "WDK_LIB=$lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-              "WDK_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-              "KS_DRIVER_WDK=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-              "found=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-              Write-Host "Using WDK $version ($lib)"
-              $found = $true
-              break
+          function Get-KitsRoots {
+            $roots = [System.Collections.Generic.List[string]]::new()
+            foreach ($key in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots')) {
+              if (Test-Path $key) {
+                $value = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).KitsRoot10
+                if ($value) { $roots.Add($value) }
+              }
             }
+            if ($env:WDKContentRoot) { $roots.Add($env:WDKContentRoot) }
+            $roots.Add("${env:ProgramFiles(x86)}\Windows Kits\10")
+            $roots.Add("$env:ProgramFiles\Windows Kits\10")
+            $roots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
           }
 
-          if (-not $found) {
+          function Find-Wdk {
+            param([string[]] $Roots)
+            foreach ($root in $Roots) {
+              $includeRoot = Join-Path $root 'Include'
+              if (-not (Test-Path $includeRoot)) { continue }
+              $versions = Get-ChildItem $includeRoot -Directory |
+                Where-Object {
+                  $_.Name -match '^\d+(\.\d+){1,3}$' -and
+                  (Test-Path (Join-Path $_.FullName 'km\ntddk.h'))
+                } |
+                Sort-Object { [version]$_.Name } -Descending |
+                Select-Object -ExpandProperty Name
+              # Prefer the version the repository documents as known good, then
+              # the newest one that also has x64 kernel libraries.
+              foreach ($version in @('10.0.26100.0') + ($versions | Where-Object { $_ -ne '10.0.26100.0' })) {
+                $lib = Join-Path $root "Lib\$version\km\x64"
+                if (Test-Path (Join-Path $lib 'ntoskrnl.lib')) {
+                  return [pscustomobject]@{ Root = $root; Version = $version; Lib = $lib }
+                }
+              }
+            }
+            return $null
+          }
+
+          $wdk = Find-Wdk -Roots @(Get-KitsRoots)
+
+          if (-not $wdk -and $env:INSTALL_WDK_IF_MISSING -ne 'false') {
+            Write-Host 'No WDK kit found; installing it with wdksetup (same payload the windows-2022 image uses).'
+            $setup = Join-Path $env:RUNNER_TEMP 'wdksetup.exe'
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2324617' -OutFile $setup
+            $proc = Start-Process -FilePath $setup -ArgumentList '/features', '+', '/quiet' -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { throw "wdksetup.exe failed with exit code $($proc.ExitCode)." }
+            $wdk = Find-Wdk -Roots @(Get-KitsRoots)
+          }
+
+          if (-not $wdk) {
+            Write-Host '--- diagnostics ---'
+            foreach ($key in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots')) {
+              if (Test-Path $key) { Write-Host $key; Get-ItemProperty -Path $key | Out-String | Write-Host }
+            }
+            foreach ($root in Get-KitsRoots) {
+              Write-Host "root: $root"
+              foreach ($sub in @('Include', 'Lib')) {
+                $path = Join-Path $root $sub
+                if (Test-Path $path) {
+                  Get-ChildItem $path -Directory | ForEach-Object { Write-Host "  $sub\$($_.Name)" }
+                }
+              }
+            }
+            Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+
             "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             if ($env:REQUIRE_WDK -ne 'false') {
-              throw "No usable WDK found under '$kitsRoot' (need Include\<ver>\km\ntddk.h and Lib\<ver>\km\x64\ntoskrnl.lib)."
+              throw 'No usable WDK found. See the diagnostics above.'
             }
             Write-Warning 'No usable WDK found; skipping the native driver image.'
+            exit 0
           }
+
+          "WDK_ROOT=$($wdk.Root)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WDK_LIB=$($wdk.Lib)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WDK_VERSION=$($wdk.Version)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KS_DRIVER_WDK=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "found=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Using WDK $($wdk.Version) ($($wdk.Lib))"
 
       # build.rs emits the Native/Driver/entry-point linker flags only when
       # KS_DRIVER_WDK=1 is set, so this is the only step that produces the .sys.
