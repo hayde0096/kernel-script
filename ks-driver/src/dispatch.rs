@@ -78,8 +78,10 @@ const DOS_NAME: &[u16] = &[
 ];
 
 pub fn driver_entry(driver: *mut DRIVER_OBJECT, _registry: *mut UNICODE_STRING) -> NTSTATUS {
+    // KDMapper manual mapping mode: driver pointer may be NULL.
+    // This is normal for manually mapped drivers.
     if driver.is_null() {
-        return STATUS_INVALID_PARAMETER;
+        return STATUS_SUCCESS;
     }
     unsafe {
         let device_name = unicode_string(DEVICE_NAME);
