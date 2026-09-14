@@ -1,0 +1,212 @@
+name: Build Driver Only
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ks-core/**'
+      - 'ks-driver/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/build-driver.yml'
+    branches: [ main, develop ]
+  pull_request:
+    paths:
+      - 'ks-core/**'
+      - 'ks-driver/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/build-driver.yml'
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  REQUIRE_WDK: "true"
+  INSTALL_WDK_IF_MISSING: "true"
+
+jobs:
+  build-driver:
+    name: build ks-driver.sys
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-win2022-cargo-target-driver-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-win2022-cargo-target-driver-
+
+      - name: Locate WDK
+        id: wdk
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-KitsRoots {
+            $roots = [System.Collections.Generic.List[string]]::new()
+            foreach ($key in @(
+              'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots')) {
+              if (Test-Path $key) {
+                $value = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).KitsRoot10
+                if ($value) { $roots.Add($value) }
+              }
+            }
+            if ($env:WDKContentRoot) { $roots.Add($env:WDKContentRoot) }
+            $roots.Add("${env:ProgramFiles(x86)}\Windows Kits\10")
+            $roots.Add("$env:ProgramFiles\Windows Kits\10")
+            $roots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+          }
+
+          function Find-Wdk {
+            param([string[]] $Roots)
+            foreach ($root in $Roots) {
+              $includeRoot = Join-Path $root 'Include'
+              if (-not (Test-Path $includeRoot)) { continue }
+              $versions = Get-ChildItem $includeRoot -Directory |
+                Where-Object {
+                  $_.Name -match '^\d+(\.\d+){1,3}$' -and
+                  (Test-Path (Join-Path $_.FullName 'km\ntddk.h'))
+                } |
+                Sort-Object { [version]$_.Name } -Descending |
+                Select-Object -ExpandProperty Name
+
+              foreach ($version in @('10.0.26100.0') + ($versions | Where-Object { $_ -ne '10.0.26100.0' })) {
+                $lib = Join-Path $root "Lib\$version\km\x64"
+                if (Test-Path (Join-Path $lib 'ntoskrnl.lib')) {
+                  return [pscustomobject]@{ Root = $root; Version = $version; Lib = $lib }
+                }
+              }
+            }
+            return $null
+          }
+
+          $wdk = Find-Wdk -Roots @(Get-KitsRoots)
+
+          if (-not $wdk -and $env:INSTALL_WDK_IF_MISSING -ne 'false') {
+            Write-Host 'No WDK kit found; installing with wdksetup...'
+            $setup = Join-Path $env:RUNNER_TEMP 'wdksetup.exe'
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2324617' -OutFile $setup
+            $proc = Start-Process -FilePath $setup -ArgumentList '/features', '+', '/quiet' -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { throw "wdksetup.exe failed with exit code $($proc.ExitCode)." }
+            $wdk = Find-Wdk -Roots @(Get-KitsRoots)
+          }
+
+          if (-not $wdk) {
+            "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            if ($env:REQUIRE_WDK -ne 'false') {
+              throw 'No usable WDK found.'
+            }
+            exit 0
+          }
+
+          "WDK_ROOT=$($wdk.Root)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WDK_LIB=$($wdk.Lib)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WDK_VERSION=$($wdk.Version)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KS_DRIVER_WDK=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "found=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Using WDK $($wdk.Version) ($($wdk.Lib))"
+
+      - name: Build ks-driver
+        if: steps.wdk.outputs.found == 'true'
+        run: cargo build --release -p ks-driver --features wdk --bin ks-driver
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $driverCandidates = @(
+            'ks-driver.sys',
+            'target\release\ks-driver.sys',
+            'target\x86_64-pc-windows-msvc\release\ks-driver.sys'
+          )
+          $driver = $driverCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($driver) {
+            Copy-Item $driver 'dist\ks-driver.sys' -Force
+            Write-Host "Driver image collected from $driver"
+          } else {
+            throw "ks-driver.sys was not produced. Checked: $($driverCandidates -join ', ')"
+          }
+
+          Copy-Item 'ks-driver\ks_driver.inf' 'dist\ks_driver.inf' -Force
+
+      - name: Inspect driver imports
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $driverPath = 'dist\ks-driver.sys'
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $dumpbin = $null
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -products * -property installationPath | Select-Object -First 1
+            if ($vsPath) {
+              $dumpbin = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe') -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -First 1
+            }
+          }
+          if (-not $dumpbin) {
+            $dumpbin = Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+          }
+          if (-not $dumpbin) { throw 'dumpbin.exe not found; cannot inspect driver image.' }
+
+          $imports = & $dumpbin.FullName /nologo /imports $driverPath | Out-String
+          $images = [regex]::Matches($imports, '(?im)^\s*([A-Za-z0-9_.\-]+\.(?:dll|sys|exe))\s*$') |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object -Unique
+          Write-Host "Imported images: $($images -join ', ')"
+
+          if ($images -match '^ntdll\.dll$') {
+            throw 'ks-driver.sys imports ntdll.dll; the kernel loader will reject this image.'
+          }
+
+          & $dumpbin.FullName /nologo /headers $driverPath |
+            Select-String -Pattern 'subsystem' |
+            Select-Object -First 2 |
+            ForEach-Object { Write-Host $_.Line.Trim() }
+
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem dist -File |
+            ForEach-Object {
+              '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+            } |
+            Set-Content -Path 'dist\SHA256SUMS.txt' -Encoding ascii
+          Get-Content 'dist\SHA256SUMS.txt' | Write-Host
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ks-driver-release
+          path: dist
+          if-no-files-found: error
+          retention-days: 30
