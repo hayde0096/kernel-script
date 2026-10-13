@@ -3,8 +3,10 @@ use std::mem::size_of;
 
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, GWL_STYLE, WS_VISIBLE,
+    EnumWindows, GetClientRect, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible,
+    GWL_STYLE, WS_VISIBLE,
 };
 
 #[derive(Clone, Debug)]
@@ -53,7 +55,30 @@ unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: isize) -> i3
     1
 }
 
+/// Client-area rect (screen coordinates), fallback DWM extended frame bounds.
+///
+/// The client area excludes the title bar and borders, so Lua gets the
+/// content position the game draws into; the DWM frame only covers
+/// borderless-style windows anyway, while a windowed window's caption
+/// would otherwise shift every consumer by the caption height. DWM rects
+/// are physical pixels — the caller (`memory.get_window_rect`) divides by
+/// the content scale.
 unsafe fn get_accurate_rect(hwnd: HWND) -> Option<WindowRect> {
+    use windows_sys::Win32::Foundation::POINT;
+    let mut origin: POINT = POINT { x: 0, y: 0 };
+    let mut client: RECT = std::mem::zeroed();
+    if ClientToScreen(hwnd, &mut origin as *mut POINT) != 0
+        && GetClientRect(hwnd, &mut client as *mut RECT) != 0
+        && client.right > client.left
+        && client.bottom > client.top
+    {
+        return Some(WindowRect {
+            x: origin.x,
+            y: origin.y,
+            width: client.right - client.left,
+            height: client.bottom - client.top,
+        });
+    }
     let mut rect: RECT = std::mem::zeroed();
     let hr = DwmGetWindowAttribute(
         hwnd,
