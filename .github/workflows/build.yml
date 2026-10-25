@@ -1,0 +1,275 @@
+# Online build for kernel-script (Windows x64 only).
+#
+# Produces, as workflow artifacts:
+#   ks-driver.sys   Native-subsystem WDM image (WDK 10.0.26100, --release only)
+#   ks-gui.exe      egui overlay + Luau runtime (`gui-release` profile)
+#   ks-test.exe     driver correctness/benchmark harness (release profile)
+#
+# Two external inputs matter:
+#
+#   secret DT_LOADER_TOKEN  read-only PAT for the private mapper crate
+#   var    DT_LOADER_REPO   optional override, default lipeilin2006/driver-loader
+#   var    DT_LOADER_REF    optional branch/tag, default repository default
+#
+# The workspace reaches the mapper through the sibling path dependency
+# `../driver-toolkit/dt-loader`. Without DT_LOADER_TOKEN the job still builds
+# ks-driver.sys (a placeholder crate keeps cargo's workspace resolution
+# happy) and skips the two binaries that link the mapper. See
+# .github/README.md.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - '**/*.md'
+      - 'document*.md'
+      - 'AGENTS.md'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'document*.md'
+      - 'AGENTS.md'
+  workflow_dispatch:
+    inputs:
+      gui_profile:
+        description: Cargo profile for ks-gui (gui-release keeps panic=unwind)
+        type: choice
+        options: [gui-release, release]
+        default: gui-release
+      publish_release:
+        description: Publish the built binaries as a draft GitHub release
+        type: boolean
+        default: false
+      release_tag:
+        description: Tag used for the draft release (publish_release only)
+        default: ci-latest
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+  GUI_PROFILE: ${{ inputs.gui_profile || 'gui-release' }}
+
+jobs:
+  windows-x64:
+    name: Windows x64 (driver + GUI + harness)
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out kernel-script
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cargo resolves the private sibling crate for every command, so this
+      # has to run before anything cargo-related (including the cache action).
+      - name: Provide the private dt-loader crate
+        id: dt_loader
+        env:
+          DT_LOADER_TOKEN: ${{ secrets.DT_LOADER_TOKEN }}
+          DT_LOADER_REPO: ${{ vars.DT_LOADER_REPO }}
+          DT_LOADER_REF: ${{ vars.DT_LOADER_REF }}
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/setup-dt-loader.ps1
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x64
+
+      - name: Check formatting (non-blocking)
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+      - name: Prepare the Windows Driver Kit
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .github/scripts/prepare-wdk.ps1
+
+      - name: Set up the MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Run the host-side unit tests
+        run: |
+          cargo test -p ks-core
+          if ($LASTEXITCODE -ne 0) { throw 'ks-core tests failed' }
+
+      # The driver must be built with --release: a dev-profile image overflows
+      # the worker thread's kernel stack on the first round trip.
+      - name: Build ks-driver.sys
+        id: driver
+        env:
+          KS_DRIVER_WDK: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workspace = $env:GITHUB_WORKSPACE
+
+          cargo build --release -p ks-driver --bin ks-driver --features wdk
+          if ($LASTEXITCODE -ne 0) { throw 'ks-driver build failed' }
+
+          # build.rs emits /OUT:ks-driver.sys, so the image lands next to the
+          # linker's working directory (the workspace root) rather than under
+          # target\release. Search instead of assuming.
+          $images = @(Get-ChildItem -LiteralPath $workspace -Filter 'ks-driver.sys' -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object -Property LastWriteTime -Descending)
+          if ($images.Count -eq 0) { throw 'the driver build produced no ks-driver.sys' }
+          $image = $images[0].FullName
+
+          $assets = Join-Path $workspace 'ks-sdk\assets'
+          New-Item -ItemType Directory -Force -Path $assets | Out-Null
+          Copy-Item -LiteralPath $image -Destination (Join-Path $assets 'ks-driver.sys') -Force
+
+          $hash = (Get-FileHash -LiteralPath $image -Algorithm SHA256).Hash
+          $size = (Get-Item -LiteralPath $image).Length
+          Write-Host ("ks-driver.sys: {0} ({1:N0} bytes, sha256 {2})" -f $image, $size, $hash)
+
+          # Guard rail from AGENTS.md: windows-sys declares Zw*/Rtl* against
+          # ntdll.dll as raw-dylib imports, and an rlib that carries them makes
+          # the kernel loader refuse the image.
+          $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbin) {
+            $dumpbin = Get-ChildItem -LiteralPath "$env:ProgramFiles\Microsoft Visual Studio" -Filter 'dumpbin.exe' -Recurse -File -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if ($dumpbin) {
+            $imports = (& $dumpbin /nologo /imports $image 2>&1 | Out-String)
+            if ($imports -match 'ntdll\.dll') {
+              throw 'ks-driver.sys imports ntdll.dll (raw-dylib trap, see AGENTS.md "Driver Import Rules")'
+            }
+            if ($imports -notmatch 'ntoskrnl\.exe') {
+              throw 'ks-driver.sys does not import ntoskrnl.exe'
+            }
+            $headers = (& $dumpbin /nologo /headers $image 2>&1 | Out-String)
+            if ($headers -notmatch 'NATIVE') {
+              throw 'ks-driver.sys is not a Native-subsystem image'
+            }
+            Write-Host 'import table: ntoskrnl.exe only, subsystem NATIVE'
+          } else {
+            Write-Warning 'dumpbin.exe not found; skipped the import-table verification'
+          }
+
+      - name: Build ks-gui.exe and ks-test.exe
+        if: steps.dt_loader.outputs.mapped == 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          cargo build --profile $env:GUI_PROFILE -p ks-gui
+          if ($LASTEXITCODE -ne 0) { throw "ks-gui build failed (profile $env:GUI_PROFILE)" }
+
+          cargo build --release -p ks-test
+          if ($LASTEXITCODE -ne 0) { throw 'ks-test build failed' }
+
+      - name: Stage the build outputs
+        if: always() && steps.driver.outcome == 'success'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workspace = $env:GITHUB_WORKSPACE
+          $dist = Join-Path $workspace 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          $candidates = [ordered]@{
+            'ks-driver.sys' = Join-Path $workspace 'ks-sdk\assets\ks-driver.sys'
+            'ks-gui.exe'    = Join-Path $workspace "target\$env:GUI_PROFILE\ks-gui.exe"
+            'ks-test.exe'   = Join-Path $workspace 'target\release\ks-test.exe'
+          }
+
+          $report = [System.Collections.Generic.List[string]]::new()
+          $report.Add('kernel-script CI build')
+          $report.Add("commit:    $env:GITHUB_SHA")
+          $report.Add("ref:       $env:GITHUB_REF")
+          $report.Add("gui:       $env:GUI_PROFILE")
+          $report.Add("run:       $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID")
+          $report.Add('')
+
+          foreach ($name in $candidates.Keys) {
+            $path = $candidates[$name]
+            if (-not (Test-Path -LiteralPath $path)) {
+              Write-Warning "$name was not built"
+              $report.Add("$name`tMISSING")
+              continue
+            }
+            Copy-Item -LiteralPath $path -Destination (Join-Path $dist $name) -Force
+            $item = Get-Item -LiteralPath $path
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            $report.Add(("{0}`t{1:N0} bytes`tsha256 {2}" -f $name, $item.Length, $hash))
+          }
+
+          [IO.File]::WriteAllText((Join-Path $dist 'BUILD.txt'), (($report -join "`n") + "`n"))
+          Get-ChildItem -LiteralPath $dist | Format-Table -AutoSize | Out-String | Write-Host
+          Get-Content -LiteralPath (Join-Path $dist 'BUILD.txt') | Write-Host
+
+      - name: Upload the build outputs
+        if: always() && steps.driver.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-script-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish a draft release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release && steps.driver.outcome == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          draft: true
+          prerelease: true
+          fail_on_unmatched_files: false
+          files: dist/*
+          body: |
+            Automated kernel-script build from `${{ github.sha }}`.
+
+            Run `ks-gui.exe` as administrator; it maps the embedded
+            `ks-driver.sys` in-process. `ks-test.exe` is the standalone
+            driver harness and also needs elevation.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write the run summary
+        if: always()
+        env:
+          DT_LOADER_MAPPED: ${{ steps.dt_loader.outputs.mapped }}
+        run: |
+          $rows = [System.Collections.Generic.List[string]]::new()
+          $rows.Add('### kernel-script build')
+          $rows.Add('')
+          $rows.Add('| item | value |')
+          $rows.Add('| --- | --- |')
+          $rows.Add("| commit | ``$env:GITHUB_SHA`` |")
+          $rows.Add("| gui profile | ``$env:GUI_PROFILE`` |")
+          if ($env:DT_LOADER_MAPPED -eq 'true') {
+            $rows.Add('| dt-loader | private crate checked out |')
+          } else {
+            $rows.Add('| dt-loader | placeholder - only ks-driver.sys was built |')
+          }
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          if (Test-Path -LiteralPath $dist) {
+            foreach ($file in Get-ChildItem -LiteralPath $dist -File) {
+              $rows.Add("| artifact | ``$($file.Name)`` - $('{0:N0}' -f $file.Length) bytes |")
+            }
+          }
+          $text = ($rows -join "`n") + "`n"
+          if ($env:GITHUB_STEP_SUMMARY) {
+            [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $text)
+          }
+          Write-Host $text
