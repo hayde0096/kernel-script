@@ -315,5 +315,19 @@ fn execute(request: &Request<'_>, response: &mut [u8]) -> (NTSTATUS, ResponseMet
                 Err(status) => (status, failure()),
             }
         }
+        Request::Alloc { pid, size, protect } => {
+            crate::trace!("alloc pid=%llu s=%lu p=0x%lx", *pid, *size, *protect);
+            match memory::allocate(*pid, *size as usize, *protect) {
+                Ok(base) => (STATUS_SUCCESS, scalar(base)),
+                Err(status) => (status, failure()),
+            }
+        }
+        Request::Free { pid, address } => {
+            crate::trace!("free pid=%llu a=%p", *pid, *address as *mut c_void);
+            match memory::free(*pid, *address) {
+                Ok(()) => (STATUS_SUCCESS, scalar(0)),
+                Err(status) => (status, failure()),
+            }
+        }
     }
 }

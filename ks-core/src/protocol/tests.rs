@@ -56,6 +56,20 @@ fn every_variant_round_trips() {
         base: 0x1A2B_0000,
         offsets: chain,
     });
+    round_trip(&Request::Alloc {
+        pid: 9,
+        size: 4096,
+        protect: ALLOC_PROTECT_READWRITE,
+    });
+    round_trip(&Request::Alloc {
+        pid: 9,
+        size: MAX_ALLOC_SIZE as u32,
+        protect: ALLOC_PROTECT_EXECUTE_READWRITE,
+    });
+    round_trip(&Request::Free {
+        pid: 9,
+        address: 0x1A2B_0000,
+    });
 }
 #[test]
 fn batch_write_round_trips_at_every_supported_count() {
@@ -311,6 +325,55 @@ fn zero_address_is_rejected_unless_rva() {
         Err(ProtocolError::InvalidPayload)
     );
 }
+#[test]
+fn alloc_and_free_validation() {
+    let mut buffer = [0u8; 8192];
+    let zero_size = Request::Alloc {
+        pid: 1,
+        size: 0,
+        protect: ALLOC_PROTECT_READWRITE,
+    };
+    assert_eq!(
+        encode_request(&zero_size, &mut buffer),
+        Err(ProtocolError::InvalidPayload)
+    );
+    let oversized = Request::Alloc {
+        pid: 1,
+        size: (MAX_ALLOC_SIZE + 1) as u32,
+        protect: ALLOC_PROTECT_READWRITE,
+    };
+    assert_eq!(
+        encode_request(&oversized, &mut buffer),
+        Err(ProtocolError::TooLarge)
+    );
+    let bad_protect = Request::Alloc {
+        pid: 1,
+        size: 4096,
+        protect: 0x80,
+    };
+    assert_eq!(
+        encode_request(&bad_protect, &mut buffer),
+        Err(ProtocolError::InvalidPayload)
+    );
+    let zero_pid = Request::Alloc {
+        pid: 0,
+        size: 4096,
+        protect: ALLOC_PROTECT_READWRITE,
+    };
+    assert_eq!(
+        encode_request(&zero_pid, &mut buffer),
+        Err(ProtocolError::InvalidPayload)
+    );
+    let zero_address = Request::Free { pid: 1, address: 0 };
+    assert_eq!(
+        encode_request(&zero_address, &mut buffer),
+        Err(ProtocolError::InvalidPayload)
+    );
+    assert!(valid_alloc_protect(ALLOC_PROTECT_READWRITE));
+    assert!(valid_alloc_protect(ALLOC_PROTECT_EXECUTE_READWRITE));
+    assert!(!valid_alloc_protect(0x02));
+}
+
 #[test]
 fn response_meta_round_trips_through_zero_padding() {
     let meta = ResponseMeta {

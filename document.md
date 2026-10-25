@@ -466,6 +466,36 @@ The response is a single Luau byte string. `string.unpack` reads fields at
 calculated offsets directly — zero intermediate Table allocation, minimal GC
 pressure.
 
+## Allocation API
+
+### memory.alloc
+
+Reserves, commits and zeroes a region of virtual memory inside a target
+process, through one driver round trip. Returns the base address.
+
+```lua
+local buffer = memory.alloc(pid, 0x1000)            -- PAGE_READWRITE
+local code = memory.alloc(pid, 0x200, 0x40)         -- PAGE_EXECUTE_READWRITE
+memory.write_bytes(pid, buffer, {1, 2, 3, 4})
+```
+
+- `size` is 1 byte to 16 MiB (`MAX_ALLOC_SIZE`); the driver rounds it up to
+  whole pages.
+- `protect` is optional and must be `0x04` (`PAGE_READWRITE`, the default) or
+  `0x40` (`PAGE_EXECUTE_READWRITE`). Any other value is rejected.
+- The allocation belongs to the target process: it is freed when that
+  process exits, and `memory.free` releases it earlier.
+
+### memory.free
+
+Releases a whole region previously returned by `memory.alloc`
+(`MEM_RELEASE`, no size needed). Freeing anything else fails with a driver
+error; it never touches other memory.
+
+```lua
+memory.free(pid, buffer)
+```
+
 ## Window Rect API
 
 ### memory.get_window_rect
@@ -492,8 +522,10 @@ end
 ```
 
 Implementation: runs `EnumWindows` in the GUI process (user session), then
-uses `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` for accurate
-rects with fallback to `GetWindowRect`.
+returns the client area (`GetClientRect` + `ClientToScreen`), so the title
+bar and borders are excluded; a window whose client rect is unavailable
+falls back to `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` and then
+`GetWindowRect`.
 
 Constraints: requires `pid` as a positive integer.
 

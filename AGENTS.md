@@ -53,11 +53,11 @@
     grants SYSTEM and Administrators. It also owns the driver lifecycle
     (`ks-gui/src/driver.rs`): a startup probe silently reuses a live
     driver or starts one through `ks_sdk::start()` on a background worker
-    at launch, the GUI's single `KernelScript` window shows the current
-    driver phase, a scrollable startup log (the lifecycle narrative plus
-    the `trying provider <id>` lines from the ks_sdk log sink) and the
-    `Stop` button (Stop only closes the overlay;
-    the `ks_sdk::stop()` shutdown runs after the render loop returns, in
+    at launch, and the memory-tool window's bottom log bar shows the
+    current driver phase, a scrollable startup log (the lifecycle
+    narrative plus the `trying provider <id>` lines from the ks_sdk log
+    sink) and a `退出程序` button (which only closes the overlay; the
+    `ks_sdk::stop()` shutdown runs after the render loop returns, in
     `driver::finish_on_exit`), and `sync_ipc` is gated while a job can
     close or replace the process-wide session (`ks_link::close_session`).
 
@@ -142,16 +142,47 @@ Rules:
   ring round trip (~60-100 us).
 - Hot reload destroys the old Lua VM.
 - Multiple Lua scripts are loaded from `scripts/*.lua`; they run on the
-  GUI Lua thread.
+  GUI Lua thread. A missing or empty `scripts` directory is **not** an
+  error: the overlay loop, the `KernelScript` driver window and the
+  memory-tool window all run without Lua.
+- The independent Cheat Engine-style memory tool
+  (`ks-gui/src/ce_window.rs`) is a second, ordinary decorated glfw window
+  created on the GUI thread with its own `egui::Context` and
+  `ThreeDBackend`. It opens automatically at startup; closing it leaves
+  the overlay running (the overlay's `内存工具` window reopens it). Layout:
+  a menu bar (`文件`/`进程`/`帮助`), the process list on the left, a
+  full-width log bar at the bottom (driver phase plus lifecycle/startup
+  log) and a tabbed centre (`内存查看` / `Lua 脚本` / `修改`, also
+  Ctrl+1/2/3):
+  - `内存查看`: hex view anchored at the target's module base, paged
+    forward in a selectable length (256 B - 4 KiB); the current page is
+    re-read every frame through the worker and changed bytes are
+    highlighted.
+  - `Lua 脚本`: lists the overlay's `scripts/*.lua`, edits one in place
+    (Ctrl+S saves). Saving writes the file, which the overlay's file-watch
+    hot reload then picks up; unsaved edits of a switched-away file stay
+    in memory as drafts. `新建` creates a script in the same directory.
+  - `修改`: manual address list with read/write and freeze/unfreeze
+    through the driver lock table; clicking an address jumps the hex tab
+    to its page.
+
+  Each frame the window renders into its own GL context (re-asserting the
+  full-window viewport, because `three_d` resets it) and then makes the
+  overlay window current again before the overlay's own pass, which
+  `gui_run` relies on. Every driver operation the window offers (process
+  list, module base, hex reads, value reads/writes/locks) runs on its one
+  worker thread through the gated `sync_ipc` facade — never on the render
+  thread.
 - Driver start/stop lives in `ks-gui/src/driver.rs` and is silent: the
   startup probe spawns a background worker running `ks_sdk::start()` when
   no live instance answers, and `driver::finish_on_exit` runs
-  `ks_sdk::stop()` after the render loop returns. The GUI shows the
-  current phase in its `KernelScript` window (`probing...` /
-  `starting...` / `running`, or the start error in red) above a
-  scrollable startup log — the lifecycle narrative plus the
-  `trying provider <id>` lines the ks_sdk log sink receives — and the
-  `Stop` button, which only closes the overlay. While such a job is in flight
+  `ks_sdk::stop()` after the render loop returns. The memory-tool window's
+  bottom log bar shows the current phase (`probing...` / `starting...` /
+  `running`, or the start error in red) above a scrollable startup log —
+  the lifecycle narrative plus the `trying provider <id>` lines the ks_sdk
+  log sink receives. The overlay itself shows no driver information, only
+  the Lua script windows (plus a small reopen/quit window while the
+  memory tool is closed). While such a job is in flight
   every `sync_ipc` call fails immediately with "the driver is
   starting". The gate is what makes `ks_link::close_session`
   safe: the job may free the process-wide session on its way out, and the
@@ -177,6 +208,8 @@ memory.batch_read(pid, size, addresses)
 memory.batch_offset(sizes)
 memory.batch_write(pid, writes)
 memory.traverse_pointer_chain(pid, base, offsets)
+memory.alloc(pid, size, protect)
+memory.free(pid, address)
 memory.lock(id, pid, address, data)
 memory.unlock(id)
 memory.unlock_all(pid)
@@ -245,7 +278,8 @@ Round-trip rules (implemented in `ks-link/src/session.rs`):
 
 Payloads are postcard-encoded (`ks-core/src/protocol/`): `Ping`,
 `GetProcessBase`, `Read`/`Write` (with `rva` and `mdl` flags), `BatchRead`,
-`BatchWrite`, `TraverseChain`, `Shutdown`, `Lock`, `Unlock`, `UnlockAll`.
+`BatchWrite`, `TraverseChain`, `Shutdown`, `Lock`, `Unlock`, `UnlockAll`,
+`Alloc`, `Free`.
 The response is a fixed 64-byte
 `ResponseMeta` slot followed by a raw bulk region the driver fills in
 place.
@@ -680,11 +714,20 @@ Before considering a change complete:
   shared physical page: image-section edits are visible to every process
   mapping that image. Keep both paths independent; do not silently fall
   back between them.
-- An `IOCTL_ALLOC_MEM` target-process allocation feature was attempted
-  twice and removed entirely; all alloc wire protocol, GUI, and Lua API
-  code is gone. If target-process allocation is ever re-attempted, verify
-  the built image with `dumpbin /imports` and route kernel calls through
-  `seh_shim.c` `ks_*` wrappers.
+- Target-process allocation is back (`Request::Alloc`/`Free`, Lua
+  `memory.alloc`/`memory.free`, `ks-driver/src/memory/alloc.rs`) after the
+  earlier `IOCTL_ALLOC_MEM` attempts were removed. It attaches to the
+  target with `KeStackAttachProcess` and allocates through
+  `ZwAllocateVirtualMemory(NT_CURRENT_PROCESS, …)`; `Free` is
+  `MEM_RELEASE`. Rules that keep it safe: it runs only on the ring worker
+  at `PASSIVE_LEVEL` with no driver lock held (attach forbids both), the
+  process reference is held for the whole call, the code is panic-free
+  (`panic = "abort"`), sizes are capped at `MAX_ALLOC_SIZE` (16 MiB) and
+  rounded up by the kernel, and `protect` is whitelisted to
+  `PAGE_READWRITE`/`PAGE_EXECUTE_READWRITE` in ks-core, ks-link and the
+  driver. Both imports (`ZwAllocateVirtualMemory`, `ZwFreeVirtualMemory`)
+  are ntoskrnl exports; after any change here re-verify `dumpbin /imports`
+  lists `ntoskrnl.exe` only.
 - A first kernel-side lock worker was removed after repeated bugchecks in
   the field; locks moved client side, then returned to the driver with the
   invariants listed in the lock rules above (fast mutex around copies only,

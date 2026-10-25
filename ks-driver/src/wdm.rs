@@ -69,6 +69,17 @@ pub const fn pid_handle(pid: u64) -> HANDLE {
     pid as usize as HANDLE
 }
 
+/// Pseudo-handle naming the current process. [`crate::memory::allocate`]
+/// uses it while attached to the target, so the allocation lands in the
+/// target's address space.
+pub const NT_CURRENT_PROCESS: HANDLE = -1isize as HANDLE;
+/// Commit the backing pages of an allocation.
+pub const MEM_COMMIT: u32 = 0x1000;
+/// Reserve (without committing) the address range.
+pub const MEM_RESERVE: u32 = 0x2000;
+/// Release a whole allocation; `ZwFreeVirtualMemory` then requires size 0.
+pub const MEM_RELEASE: u32 = 0x8000;
+
 /// `SECTION_BASIC_INFORMATION` as consumed by `ZwQuerySection` with
 /// `SectionBasicInformation`.
 #[repr(C)]
@@ -194,6 +205,26 @@ extern "system" {
     pub fn PsGetCurrentThread() -> PKTHREAD;
 
     pub fn ObDereferenceObject(object: Pvoid);
+
+    /// Target-process virtual-memory allocation through the attached
+    /// address space (`NT_CURRENT_PROCESS`). The kernel rounds `region_size`
+    /// up to whole pages and writes the rounded size back.
+    pub fn ZwAllocateVirtualMemory(
+        process_handle: HANDLE,
+        base_address: *mut Pvoid,
+        zero_bits: usize,
+        region_size: *mut usize,
+        allocation_type: u32,
+        page_protection: u32,
+    ) -> NTSTATUS;
+    /// Releases a region previously returned by
+    /// [`ZwAllocateVirtualMemory`] (`MEM_RELEASE`, size 0).
+    pub fn ZwFreeVirtualMemory(
+        process_handle: HANDLE,
+        base_address: *mut Pvoid,
+        region_size: *mut usize,
+        free_type: u32,
+    ) -> NTSTATUS;
 
     /// `DbgPrint` from ntoskrnl.exe: varargs printf into the kernel debug
     /// pipe. The format string is a NUL-terminated UTF-8 literal; the

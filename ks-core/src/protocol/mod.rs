@@ -31,6 +31,19 @@ pub const MAX_MEMORY_LOCKS: usize = 64;
 pub const MAX_MEMORY_LOCK_SIZE: usize = 4096;
 /// Convenience alias used by the Lua layer for write sizes.
 pub const MAX_WRITE_SIZE: usize = MAX_DRIVER_TRANSFER_SIZE;
+/// Largest single target-process allocation accepted by the driver.
+pub const MAX_ALLOC_SIZE: usize = 16 * 1024 * 1024;
+/// `PAGE_READWRITE`: the default protection for [`Request::Alloc`].
+pub const ALLOC_PROTECT_READWRITE: u32 = 0x04;
+/// `PAGE_EXECUTE_READWRITE`, the only executable protection the driver
+/// hands out (kept explicit so a script cannot silently allocate RWX).
+pub const ALLOC_PROTECT_EXECUTE_READWRITE: u32 = 0x40;
+
+/// Whether `protect` is one of the two protections [`Request::Alloc`]
+/// accepts. Everything else is rejected at every trust boundary.
+pub const fn valid_alloc_protect(protect: u32) -> bool {
+    protect == ALLOC_PROTECT_READWRITE || protect == ALLOC_PROTECT_EXECUTE_READWRITE
+}
 
 /// One entry of a batch write. `data` borrows straight out of the ring.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,6 +119,22 @@ pub enum Request<'a> {
     /// Remove every lock entry held against `pid`.
     UnlockAll {
         pid: u64,
+    },
+    /// Reserve, commit and zero one region of target-process virtual
+    /// memory. `protect` must satisfy [`valid_alloc_protect`]; the reply
+    /// carries the base address in [`ResponseMeta::value`]. The driver
+    /// rounds `size` up to the page size.
+    Alloc {
+        pid: u64,
+        size: u32,
+        protect: u32,
+    },
+    /// Release a region returned by [`Request::Alloc`]. The whole region is
+    /// freed (`MEM_RELEASE`), so no size is carried; freeing an address
+    /// that was not allocated by [`Request::Alloc`] fails in the driver.
+    Free {
+        pid: u64,
+        address: u64,
     },
 }
 
@@ -272,6 +301,26 @@ impl<'a> Request<'a> {
                 }
             }
             Self::UnlockAll { pid } => check_pid(*pid),
+            Self::Alloc { pid, size, protect } => {
+                check_pid(*pid)?;
+                if *size == 0 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                if *size as usize > MAX_ALLOC_SIZE {
+                    return Err(ProtocolError::TooLarge);
+                }
+                if !valid_alloc_protect(*protect) {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(())
+            }
+            Self::Free { pid, address } => {
+                check_pid(*pid)?;
+                if *address == 0 {
+                    return Err(ProtocolError::InvalidPayload);
+                }
+                Ok(())
+            }
         }
     }
 }

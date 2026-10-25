@@ -75,8 +75,13 @@ impl LuaRuntimeManager {
                 .parent()
                 .unwrap_or(script_directory.as_path()),
         );
+        // A missing or empty `scripts` directory is not an error: the
+        // overlay, the driver window and the memory-tool window all run
+        // without Lua, so the GUI must start regardless. `.lua` files whose
+        // stem starts with `_` are treated as disabled.
         let mut paths = fs::read_dir(&script_directory)
-            .map_err(mlua::Error::external)?
+            .into_iter()
+            .flatten()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|extension| extension == "lua"))
@@ -88,10 +93,10 @@ impl LuaRuntimeManager {
             .collect::<Vec<_>>();
         paths.sort();
         if paths.is_empty() {
-            return Err(mlua::Error::external(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no Lua scripts found",
-            )));
+            tracing::info!(
+                directory = %script_directory.display(),
+                "no Lua scripts loaded; the overlay and memory tool still run"
+            );
         }
         let runtimes = paths
             .into_iter()

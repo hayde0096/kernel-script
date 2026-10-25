@@ -244,6 +244,34 @@ pub fn register_memory_api(lua: &Lua) -> mlua::Result<()> {
         )?,
     )?;
 
+    // memory.alloc(pid, size [, protect]) -> address
+    // Reserves, commits and zeroes `size` bytes in the target and returns
+    // the base address. `protect` defaults to PAGE_READWRITE (0x04); the
+    // only executable option is PAGE_EXECUTE_READWRITE (0x40). The driver
+    // rounds the size up to whole pages; `memory.free` releases it.
+    module.set(
+        "alloc",
+        lua.create_function(
+            |_, (pid, size, protect): (u64, u64, Option<u32>)| -> mlua::Result<u64> {
+                let protect = protect.unwrap_or(ks_core::protocol::ALLOC_PROTECT_READWRITE);
+                if !ks_core::protocol::valid_alloc_protect(protect) {
+                    return Err(mlua::Error::runtime("invalid allocation protection"));
+                }
+                if size == 0 || size > ks_core::protocol::MAX_ALLOC_SIZE as u64 {
+                    return Err(mlua::Error::runtime("invalid allocation size"));
+                }
+                crate::sync_ipc::alloc(pid, size, protect).map_err(mlua::Error::runtime)
+            },
+        )?,
+    )?;
+
+    module.set(
+        "free",
+        lua.create_function(|_, (pid, address): (u64, Address)| -> mlua::Result<()> {
+            crate::sync_ipc::free(pid, address.get()).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+
     module.set(
         "lock",
         lua.create_function(

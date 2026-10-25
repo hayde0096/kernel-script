@@ -4,14 +4,14 @@
 //! the probe reports a stopped driver, and [`finish_on_exit`] shuts a live
 //! driver down again after the render loop has returned. The module also
 //! owns the gate that keeps `sync_ipc` round trips away from the
-//! process-wide session while such a job can close or replace it. The GUI
-//! renders this as one small `KernelScript` window: the current phase
-//! (`probing...`, `starting...`, `running`, or the start error in red)
-//! above a scrollable startup log — the lifecycle narrative plus the
+//! process-wide session while such a job can close or replace it.
+//!
+//! The GUI shows this in the memory-tool window's bottom log bar: the
+//! current phase (`probing...`, `starting...`, `running`, or the start
+//! error in red) above the startup log — the lifecycle narrative plus the
 //! `trying provider <id>` lines the ks_sdk log sink receives while
-//! `ks_sdk::start` walks its provider chain — and the window's only
-//! control, the `Stop` button, which just requests the overlay to close;
-//! the shutdown itself runs in [`finish_on_exit`].
+//! `ks_sdk::start` walks its provider chain. The overlay itself only shows
+//! the Lua script windows.
 //!
 //! Threading rules:
 //! - The GUI thread owns [`DriverControl`]; a worker only sends an
@@ -44,7 +44,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Cap for the startup log the `KernelScript` window shows; the oldest
+/// Cap for the startup log the memory-tool log bar shows; the oldest
 /// line is dropped beyond it.
 const MAX_LOG_LINES: usize = 200;
 
@@ -57,7 +57,7 @@ pub fn lifecycle_busy() -> bool {
     LIFECYCLE_BUSY.load(Ordering::Acquire)
 }
 
-/// What [`DriverControl::ui`] displays for the current lifecycle state.
+/// What the memory-tool log bar displays for the current lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     Probing,
@@ -93,7 +93,7 @@ enum Outcome {
 }
 
 pub struct DriverControl {
-    /// The state the `KernelScript` window shows; updated by [`Self::poll`]
+    /// The state the memory-tool log bar shows; updated by [`Self::poll`]
     /// when a job outcome arrives, never by the worker itself.
     phase: Phase,
     tx: Sender<Outcome>,
@@ -101,7 +101,7 @@ pub struct DriverControl {
     /// Startup log lines shared with the ks_sdk log sink: the sink
     /// appends `trying provider <id>` lines from the worker thread
     /// inside `ks_sdk::start`, the GUI thread appends the lifecycle
-    /// narrative, and [`Self::ui`] reads the buffer for display.
+    /// narrative, and [`Self::logs_snapshot`] reads the buffer for display.
     logs: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -183,44 +183,19 @@ impl DriverControl {
         }
     }
 
-    /// Draws the `KernelScript` window — the current driver phase, then
-    /// the scrollable startup log, then the `Stop` button — and returns
-    /// true when `Stop` was clicked, i.e. when the caller should close
-    /// the overlay window. Pure display: no lifecycle job is spawned
-    /// from here.
-    pub fn ui(&self, ctx: &egui::Context) -> bool {
-        let mut stop_clicked = false;
-        egui::Window::new("KernelScript")
-            .default_pos(egui::pos2(16.0, 16.0))
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                match &self.phase {
-                    Phase::Failed(error) => {
-                        ui.colored_label(egui::Color32::LIGHT_RED, format!("driver: {error}"));
-                    }
-                    phase => {
-                        ui.label(format!("driver: {}", phase.label()));
-                    }
-                }
-                {
-                    let logs = self.logs.lock().unwrap_or_else(|error| error.into_inner());
-                    if !logs.is_empty() {
-                        egui::ScrollArea::vertical()
-                            .max_height(140.0)
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                for line in logs.iter() {
-                                    ui.monospace(line);
-                                }
-                            });
-                    }
-                }
-                if ui.button("Stop").clicked() {
-                    stop_clicked = true;
-                }
-            });
-        stop_clicked
+    /// `(is_error, text)` for the memory-tool log bar's status line.
+    pub fn status_text(&self) -> (bool, String) {
+        match &self.phase {
+            Phase::Failed(error) => (true, format!("driver: {error}")),
+            phase => (false, format!("driver: {}", phase.label())),
+        }
+    }
+
+    /// Snapshot of the startup log for the memory-tool log bar. Copies
+    /// owned strings so the bar renders without holding the lock.
+    pub fn logs_snapshot(&self) -> Vec<String> {
+        let logs = self.logs.lock().unwrap_or_else(|error| error.into_inner());
+        logs.iter().cloned().collect()
     }
 
     /// Marks the gate closed, publishes the matching phase, and runs the

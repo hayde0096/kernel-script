@@ -440,6 +440,32 @@ end
 响应是单个 Luau byte string。`string.unpack` 直接在缓冲区上按偏移读取字段
 ——零中间 Table 分配，GC 压力极低。
 
+## 内存分配 API
+
+### memory.alloc
+
+在目标进程内保留、提交并清零一段虚拟内存，一次驱动往返完成。返回基址。
+
+```lua
+local buffer = memory.alloc(pid, 0x1000)            -- PAGE_READWRITE
+local code = memory.alloc(pid, 0x200, 0x40)         -- PAGE_EXECUTE_READWRITE
+memory.write_bytes(pid, buffer, {1, 2, 3, 4})
+```
+
+- `size` 允许 1 字节到 16 MiB（`MAX_ALLOC_SIZE`），驱动会向上取整到页。
+- `protect` 可选，只接受 `0x04`（`PAGE_READWRITE`，默认）或 `0x40`
+  （`PAGE_EXECUTE_READWRITE`），其它值一律拒绝。
+- 分配属于目标进程：目标退出时随之释放，也可以提前用 `memory.free` 释放。
+
+### memory.free
+
+释放 `memory.alloc` 返回的整段内存（`MEM_RELEASE`，无需大小）。释放其它
+地址会返回驱动错误，不会改动其它内存。
+
+```lua
+memory.free(pid, buffer)
+```
+
 ## 窗口查询 API
 
 ### memory.get_window_rect
@@ -465,9 +491,10 @@ if rects then
 end
 ```
 
-实现方式：在 GUI 进程（用户会话）中运行 `EnumWindows`，使用
-`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` 获取精确窗口位置，
-失败时回退到 `GetWindowRect`。
+实现方式：在 GUI 进程（用户会话）中运行 `EnumWindows`，返回客户区
+（`GetClientRect` + `ClientToScreen`），不含标题栏和边框；客户区不可用时
+回退到 `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`，再回退到
+`GetWindowRect`。
 
 约束：`pid` 必须为正整数。
 

@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 mod app;
+mod ce_window;
 mod config_store;
 mod driver;
 mod overlay;

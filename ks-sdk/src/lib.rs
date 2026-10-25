@@ -10,7 +10,8 @@
 //!   disk; `stop` shuts the driver down again.
 //! * The whole [`ks_link`] API re-exported at the crate root — session,
 //!   ring round trips, process enumeration, memory reads/writes, batch
-//!   operations, pointer walks and memory locks:
+//!   operations, pointer walks, target-process allocation and memory
+//!   locks:
 //!
 //! ```text
 //! ks_sdk::start()?;                          // load the driver

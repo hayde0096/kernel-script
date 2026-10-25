@@ -24,6 +24,7 @@ pub(crate) fn run_checks(target: &Arc<Target>, failures: &mut Vec<(String, Strin
     check_batch(t, failures);
     check_chain(t, failures);
     check_locks(t, failures);
+    check_alloc(t, failures);
 
     check(failures, "concurrent ring access", || {
         run_concurrency_smoke(target)
@@ -491,6 +492,64 @@ fn check_locks(t: &Target, failures: &mut Vec<(String, String)>) {
             .map_err(|e| format!("read after unlock_all: {e}"))?;
         if u32_at(&cleared, 0) != 0xDEAD_BEEF {
             return Err("a lock kept rewriting after unlock_all".into());
+        }
+        Ok(())
+    });
+}
+
+/// Target-process allocation: reserve/commit a page in this process,
+/// write and read it back through the normal (non-MDL) paths, then free
+/// it. The second check covers the guard rails the driver enforces before
+/// it touches the address space.
+fn check_alloc(t: &Target, failures: &mut Vec<(String, String)>) {
+    check(failures, "alloc/write/read/free roundtrip", || {
+        let size = 0x1000usize;
+        let address = ks_sdk::alloc(t.pid, size, ks_core::protocol::ALLOC_PROTECT_READWRITE)
+            .map_err(|e| format!("alloc: {e}"))?;
+        if address == 0 {
+            return Err("alloc returned a null base".into());
+        }
+        let pattern: Vec<u8> = (0..64u8)
+            .map(|index| index.wrapping_mul(7).wrapping_add(3))
+            .collect();
+        let write = ks_sdk::write_bytes(t.pid, address, &pattern, false, false)
+            .map_err(|e| format!("write: {e}"));
+        let read = ks_sdk::read_bytes(t.pid, address, pattern.len(), false, false)
+            .map_err(|e| format!("read: {e}"));
+        let freed = ks_sdk::free(t.pid, address).map_err(|e| format!("free: {e}"));
+        write?;
+        let data = read?;
+        freed?;
+        if data != pattern {
+            return Err(format!(
+                "read back {:02X?}, want {:02X?}",
+                &data[..data.len().min(16)],
+                &pattern[..pattern.len().min(16)]
+            ));
+        }
+        Ok(())
+    });
+
+    check(failures, "alloc rejects oversize and bad protect", || {
+        if ks_sdk::alloc(
+            t.pid,
+            ks_core::protocol::MAX_ALLOC_SIZE + 1,
+            ks_core::protocol::ALLOC_PROTECT_READWRITE,
+        )
+        .is_ok()
+        {
+            return Err("oversize allocation accepted".into());
+        }
+        if ks_sdk::alloc(t.pid, 0x1000, 0x80).is_ok() {
+            return Err("unsupported protection accepted".into());
+        }
+        // A second free of the same region must fail instead of releasing
+        // someone else's memory.
+        let address = ks_sdk::alloc(t.pid, 0x1000, ks_core::protocol::ALLOC_PROTECT_READWRITE)
+            .map_err(|e| format!("alloc for double free: {e}"))?;
+        ks_sdk::free(t.pid, address).map_err(|e| format!("first free: {e}"))?;
+        if ks_sdk::free(t.pid, address).is_ok() {
+            return Err("double free succeeded".into());
         }
         Ok(())
     });

@@ -4,7 +4,7 @@ use crate::wdm::*;
 use ks_core::protocol::{BatchWriteItem, MAX_DRIVER_TRANSFER_SIZE};
 
 /// RAII owner for the reference returned by PsLookupProcessByProcessId.
-struct ProcessRef(isize);
+pub(super) struct ProcessRef(pub(super) isize);
 impl Drop for ProcessRef {
     fn drop(&mut self) {
         unsafe {
@@ -200,7 +200,7 @@ pub fn read_process_memory(
         Err(status)
     }
 }
-fn lookup(process_id: u64) -> Result<ProcessRef, NTSTATUS> {
+pub(super) fn lookup(process_id: u64) -> Result<ProcessRef, NTSTATUS> {
     let mut process = 0isize;
     let status = unsafe { PsLookupProcessByProcessId(pid_handle(process_id), &mut process) };
     if !nt_success(status) || process == 0 {

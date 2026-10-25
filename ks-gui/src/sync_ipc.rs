@@ -108,6 +108,17 @@ pub fn traverse_pointer_chain(pid: u64, base: u64, offsets: &[u64]) -> Result<u6
     ks_sdk::traverse_pointer_chain(pid, base, offsets).map_err(reason)
 }
 
+pub fn alloc(pid: u64, size: u64, protect: u32) -> Result<u64, String> {
+    gate()?;
+    let size = usize::try_from(size).map_err(|_| "size does not fit usize".to_string())?;
+    ks_sdk::alloc(pid, size, protect).map_err(reason)
+}
+
+pub fn free(pid: u64, address: u64) -> Result<(), String> {
+    gate()?;
+    ks_sdk::free(pid, address).map_err(reason)
+}
+
 pub fn lock(id: u64, pid: u64, address: u64, data: &[u8]) -> Result<(), String> {
     gate()?;
     ks_sdk::lock(id, pid, address, data).map_err(reason)

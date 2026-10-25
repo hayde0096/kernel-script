@@ -15,14 +15,15 @@ mod session;
 
 use heapless::Vec as SmallVec;
 use ks_core::protocol::{
-    BatchWriteItem, Request, MAX_BATCH_ENTRIES, MAX_BATCH_WRITE_ENTRIES, MAX_CHAIN_OFFSETS,
+    valid_alloc_protect, BatchWriteItem, ProtocolError, Request, MAX_ALLOC_SIZE, MAX_BATCH_ENTRIES,
+    MAX_BATCH_WRITE_ENTRIES, MAX_CHAIN_OFFSETS,
 };
 
 pub use error::LinkError;
 pub use lock::{lock, lock_rva, unlock, unlock_all, unlock_rva};
 pub use lock::{MAX_MEMORY_LOCKS, MAX_MEMORY_LOCK_SIZE};
 pub use names::{instance_claim_present, published_object_names, published_object_names_strict};
-pub use process::find_pid;
+pub use process::{find_pid, list, ProcessError, ProcessInfo};
 pub use session::close_session;
 
 use session::submit;
@@ -152,6 +153,36 @@ pub fn traverse_pointer_chain(pid: u64, base: u64, offsets: &[u64]) -> Result<u6
         &mut [],
     )?;
     Ok(meta.value)
+}
+
+/// Allocates `size` bytes in `pid` and returns the base address. `protect`
+/// must be [`ks_core::protocol::ALLOC_PROTECT_READWRITE`] or
+/// [`ks_core::protocol::ALLOC_PROTECT_EXECUTE_READWRITE`]; the driver
+/// rounds the size up to whole pages.
+pub fn alloc(pid: u64, size: usize, protect: u32) -> Result<u64, LinkError> {
+    if size == 0 || size > MAX_ALLOC_SIZE {
+        return Err(LinkError::Encode(ProtocolError::TooLarge));
+    }
+    if !valid_alloc_protect(protect) {
+        return Err(LinkError::Encode(ProtocolError::InvalidPayload));
+    }
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    let (meta, _) = submit(
+        &Request::Alloc {
+            pid,
+            size: size as u32,
+            protect,
+        },
+        &mut buffer,
+        &mut [],
+    )?;
+    Ok(meta.value)
+}
+
+/// Frees a whole region previously returned by [`alloc`].
+pub fn free(pid: u64, address: u64) -> Result<(), LinkError> {
+    let mut buffer = [0u8; SMALL_REQUEST_BUFFER];
+    submit(&Request::Free { pid, address }, &mut buffer, &mut []).map(|_| ())
 }
 
 fn addresses_small_vec<const N: usize>(
